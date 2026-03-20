@@ -1170,12 +1170,15 @@ class FastCode:
             self.vector_store.initialize(self.embedder.embedding_dim)
             
             # Load each repository index and merge them
+            previously_loaded = self.loaded_repositories
+            successfully_loaded = []
             for repo_name in repos_to_load:
                 self.logger.info(f"Loading index for {repo_name}...")
                 try:
                     # Merge this repository's index into the main vector store
                     if self.vector_store.merge_from_index(repo_name):
                         self.logger.info(f"Successfully merged {repo_name}")
+                        successfully_loaded.append(repo_name)
                     else:
                         self.logger.warning(f"Failed to merge index for {repo_name}")
                         
@@ -1188,15 +1191,17 @@ class FastCode:
                 self.logger.error("Failed to load any repository indexes")
                 return False
             
-            # Register loaded repositories
-            # We know which repos were successfully loaded from repos_to_load
-            for repo_name in repos_to_load:
-                if repo_name not in self.loaded_repositories:
-                    self.loaded_repositories[repo_name] = {
-                        "name": repo_name,
-                        "file_count": 0,  # Will be updated if needed
-                        "total_size_mb": 0,
-                    }
+            # Register only the repositories that are actually present in memory.
+            self.loaded_repositories = {}
+            for repo_name in successfully_loaded:
+                repo_info = previously_loaded.get(repo_name, {})
+                self.loaded_repositories[repo_name] = {
+                    "name": repo_name,
+                    "file_count": repo_info.get("file_count", 0),
+                    "total_size_mb": repo_info.get("total_size_mb", 0),
+                    **({"url": repo_info["url"]} if "url" in repo_info else {}),
+                    **({"path": repo_info["path"]} if "path" in repo_info else {}),
+                }
             
             # Try to load BM25 and graph data from saved files
             # For multi-repo, we merge BM25 data from all loaded repositories
@@ -1206,7 +1211,7 @@ class FastCode:
             all_bm25_corpus = []
             graphs_loaded = False
             
-            for repo_name in repos_to_load:
+            for repo_name in successfully_loaded:
                 # Try loading BM25 for each repo
                 bm25_path = os.path.join(self.retriever.persist_dir, f"{repo_name}_bm25.pkl")
                 if os.path.exists(bm25_path):
@@ -1330,20 +1335,19 @@ class FastCode:
             self.logger.warning(f"Failed to load manifest for '{repo_name}': {e}")
             return None
 
-    def _load_existing_metadata(self, repo_name: str) -> list:
-        """Load existing vector store metadata for a repo directly from disk."""
+    def _load_existing_metadata(self, repo_name: str) -> dict:
+        """Load an existing vector store payload for a repo directly from disk."""
         meta_path = os.path.join(
             self.vector_store.persist_dir, f"{repo_name}_metadata.pkl"
         )
         if not os.path.exists(meta_path):
-            return []
+            return {}
         try:
             with open(meta_path, "rb") as f:
-                data = pickle.load(f)
-            return data.get("metadata", [])
+                return pickle.load(f)
         except Exception as e:
             self.logger.warning(f"Failed to load metadata for '{repo_name}': {e}")
-            return []
+            return {}
 
     def _detect_file_changes(self, repo_name, current_files):
         """Compare current files against saved manifest to detect changes.
@@ -1440,7 +1444,8 @@ class FastCode:
             return {"status": "path_not_found", "changes": 0}
 
         self.loader.load_from_path(repo_path)
-        self.config["repo_root"] = repo_path
+        effective_repo_path = self.loader.repo_path or repo_path
+        self.config["repo_root"] = effective_repo_path
 
         # 3. Scan current files and detect changes
         current_files = self.loader.scan_files()
@@ -1462,10 +1467,32 @@ class FastCode:
             return {"status": "no_changes", "changes": 0}
 
         # 4. Load existing metadata from disk
-        existing_metadata = self._load_existing_metadata(repo_name)
+        existing_payload = self._load_existing_metadata(repo_name)
+        if isinstance(existing_payload, dict) and "metadata" in existing_payload:
+            existing_metadata = existing_payload.get("metadata", [])
+            persisted_dimension = existing_payload.get("dimension")
+        else:
+            existing_metadata = existing_payload or []
+            persisted_dimension = None
+
         if not existing_metadata:
             self.logger.warning(f"No existing metadata for '{repo_name}'")
             return {"status": "no_metadata", "changes": 0}
+
+        current_dimension = self.embedder.embedding_dim
+        if persisted_dimension is not None and persisted_dimension != current_dimension:
+            self.logger.warning(
+                "Embedding dimension mismatch for '%s': persisted=%s current=%s",
+                repo_name,
+                persisted_dimension,
+                current_dimension,
+            )
+            return {
+                "status": "embedding_dimension_mismatch",
+                "changes": total_changes,
+                "persisted_dimension": persisted_dimension,
+                "current_dimension": current_dimension,
+            }
 
         # 5. Collect unchanged elements (with pre-computed embeddings)
         unchanged_elements, _ = self._collect_unchanged_elements(
@@ -1520,13 +1547,28 @@ class FastCode:
 
         # 8. Rebuild FAISS (temporary store — main instance untouched)
         temp_store = VectorStore(self.config)
-        temp_store.initialize(self.embedder.embedding_dim)
+        temp_store.initialize(current_dimension)
 
         vectors, metadata_list = [], []
         for elem in all_elements:
             embedding = elem.metadata.get("embedding")
             if embedding is not None:
-                vectors.append(embedding)
+                embedding_array = np.asarray(embedding, dtype=np.float32)
+                if embedding_array.ndim != 1 or embedding_array.shape[0] != current_dimension:
+                    self.logger.warning(
+                        "Embedding shape mismatch for '%s' element '%s': expected=%s got=%s",
+                        repo_name,
+                        elem.id,
+                        current_dimension,
+                        tuple(embedding_array.shape),
+                    )
+                    return {
+                        "status": "embedding_dimension_mismatch",
+                        "changes": total_changes,
+                        "persisted_dimension": persisted_dimension,
+                        "current_dimension": current_dimension,
+                    }
+                vectors.append(embedding_array)
                 metadata_list.append(elem.to_dict())
 
         if vectors:
@@ -1535,7 +1577,7 @@ class FastCode:
         # 9. Rebuild BM25 (temporary retriever)
         temp_retriever = HybridRetriever(
             self.config, temp_store, self.embedder,
-            CodeGraphBuilder(self.config), repo_root=repo_path,
+            CodeGraphBuilder(self.config), repo_root=effective_repo_path,
         )
         temp_retriever.index_for_bm25(all_elements)
 
@@ -1544,7 +1586,7 @@ class FastCode:
         module_resolver, symbol_resolver = None, None
         try:
             gib = GlobalIndexBuilder(self.config)
-            gib.build_maps(all_elements, repo_path)
+            gib.build_maps(all_elements, effective_repo_path)
             module_resolver = ModuleResolver(gib)
             symbol_resolver = SymbolResolver(gib, module_resolver)
         except Exception as e:
@@ -1552,12 +1594,34 @@ class FastCode:
 
         temp_graph.build_graphs(all_elements, module_resolver, symbol_resolver)
 
+        # Refresh repository overview so repo-level selection and summaries stay in sync.
+        overview_generator = getattr(self.indexer, "overview_generator", None)
+        if overview_generator and effective_repo_path:
+            try:
+                file_structure = overview_generator.parse_file_structure(
+                    effective_repo_path, current_files
+                )
+                repo_overview = overview_generator.generate_overview(
+                    effective_repo_path, repo_name, file_structure
+                )
+                repo_url = (
+                    self.loaded_repositories.get(repo_name, {}).get("url")
+                    or self.loaded_repositories.get(repo_name, {}).get("remote_url")
+                )
+                self.indexer.current_repo_name = repo_name
+                self.indexer.current_repo_url = repo_url
+                self.indexer._save_repository_overview(repo_overview)
+            except Exception as e:
+                self.logger.warning(
+                    f"Failed to refresh repository overview for '{repo_name}': {e}"
+                )
+
         # 11. Save all artifacts
         if self._should_persist_indexes():
             temp_store.save(repo_name)
             temp_retriever.save_bm25(repo_name)
             temp_graph.save(repo_name)
-            new_manifest = self._build_file_manifest(all_elements, repo_path)
+            new_manifest = self._build_file_manifest(all_elements, effective_repo_path)
             self._save_file_manifest(repo_name, new_manifest)
             self.logger.info(f"Saved all artifacts for '{repo_name}'")
 
