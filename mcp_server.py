@@ -3,8 +3,8 @@ FastCode MCP Server - Expose repo-level code understanding via MCP protocol.
 
 Usage:
     python mcp_server.py                    # stdio transport (default)
-    python mcp_server.py --transport sse    # SSE transport on port 8080
-    python mcp_server.py --port 9090        # SSE on custom port
+    python mcp_server.py --transport sse    # SSE transport (default host/port)
+    python mcp_server.py --transport streamable-http --host 0.0.0.0 --port 5555
 
 MCP config example (for Claude Code / Cursor):
     {
@@ -15,7 +15,7 @@ MCP config example (for Claude Code / Cursor):
           "env": {
             "MODEL": "your-model",
             "BASE_URL": "your-base-url",
-            "API_KEY": "your-api-key"
+            "OPENAI_API_KEY": "your-api-key"
           }
         }
       }
@@ -28,7 +28,11 @@ import logging
 import asyncio
 import uuid
 import inspect
-from typing import Optional, List
+import hashlib
+import subprocess
+import pickle
+import yaml
+from typing import Optional, List, Set
 
 # Ensure project root is on sys.path
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -62,6 +66,7 @@ def _get_fastcode():
     if _fastcode_instance is None:
         logger.info("Initializing FastCode engine …")
         from fastcode import FastCode
+
         _fastcode_instance = FastCode()
         logger.info("FastCode engine ready.")
     return _fastcode_instance
@@ -69,17 +74,253 @@ def _get_fastcode():
 
 def _repo_name_from_source(source: str, is_url: bool) -> str:
     """Derive a canonical repo name from a URL or local path."""
-    from fastcode.utils import get_repo_name_from_url
     if is_url:
-        return get_repo_name_from_url(source)
-    # Local path: use the directory basename
-    return os.path.basename(os.path.normpath(source))
+        return _repo_name_from_url(source)
+
+    normalized = _normalize_local_source(source)
+    base_name = os.path.basename(os.path.normpath(normalized)) or "local_repo"
+    wt_info = _detect_worktree_context(normalized)
+    if wt_info:
+        # Worktree-safe key: stable per worktree path/common-dir context.
+        token = wt_info["token"]
+        return f"{base_name}__wt__{token}"
+
+    return base_name
+
+
+def _legacy_repo_name_from_source(source: str, is_url: bool) -> str:
+    """Legacy repo key for compatibility with pre-worktree indexes."""
+    if is_url:
+        return _repo_name_from_url(source)
+    normalized = _normalize_local_source(source)
+    return os.path.basename(os.path.normpath(normalized)) or "local_repo"
+
+
+def _normalize_local_source(source: str) -> str:
+    """Normalize local source path (expand ~/$VARS + absolute path)."""
+    expanded = os.path.expandvars(os.path.expanduser((source or "").strip()))
+    return os.path.realpath(os.path.abspath(expanded))
+
+
+def _repo_name_from_url(url: str) -> str:
+    """Extract repository name from URL in a lightweight way."""
+    cleaned = (url or "").strip().rstrip("/")
+    if cleaned.endswith(".git"):
+        cleaned = cleaned[:-4]
+    parts = cleaned.split("/")
+    return parts[-1] if parts else "unknown_repo"
+
+
+def _get_persist_dir() -> str:
+    """Resolve vector-store persist directory without FastCode initialization."""
+    config_path = os.path.join(PROJECT_ROOT, "config", "config.yaml")
+    default_rel = os.path.join("data", "vector_store")
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw_cfg = yaml.safe_load(f) or {}
+    except Exception:
+        return os.path.join(PROJECT_ROOT, default_rel)
+
+    vector_cfg = raw_cfg.get("vector_store", {}) if isinstance(raw_cfg, dict) else {}
+    persist = vector_cfg.get("persist_directory", default_rel)
+    if os.path.isabs(persist):
+        return os.path.realpath(persist)
+    return os.path.realpath(os.path.join(PROJECT_ROOT, persist))
+
+
+def _scan_available_indexes_light() -> list[dict]:
+    """Lightweight index scanner that avoids FastCode/model initialization."""
+    persist_dir = _get_persist_dir()
+    if not os.path.isdir(persist_dir):
+        return []
+
+    repos = []
+    for file_name in os.listdir(persist_dir):
+        if not file_name.endswith(".faiss"):
+            continue
+        name = file_name[:-6]
+        metadata_file = os.path.join(persist_dir, f"{name}_metadata.pkl")
+        if not os.path.exists(metadata_file):
+            continue
+
+        element_count = 0
+        size_mb = 0.0
+        try:
+            size_mb = (
+                os.path.getsize(os.path.join(persist_dir, file_name))
+                + os.path.getsize(metadata_file)
+            ) / (1024 * 1024)
+            with open(metadata_file, "rb") as f:
+                meta_data = pickle.load(f)
+            element_count = len(meta_data.get("metadata", []))
+        except Exception:
+            pass
+
+        repos.append(
+            {
+                "name": name,
+                "element_count": element_count,
+                "size_mb": round(size_mb, 2),
+            }
+        )
+
+    return sorted(repos, key=lambda x: x["name"])
+
+
+def _run_git(path: str, *args: str) -> Optional[str]:
+    """Run git command with -C path; return stripped stdout or None."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", path, *args],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return None
+
+    if proc.returncode != 0:
+        return None
+
+    out = (proc.stdout or "").strip()
+    return out or None
+
+
+def _detect_worktree_context(path: str) -> Optional[dict]:
+    """
+    Detect git worktree context for a local path.
+
+    Returns:
+        {"toplevel": str, "common_dir": str, "branch": str, "token": str}
+        or None when the path is not inside a git worktree.
+    """
+    toplevel = _run_git(path, "rev-parse", "--show-toplevel")
+    if not toplevel:
+        return None
+
+    common_dir = _run_git(path, "rev-parse", "--git-common-dir")
+    if not common_dir:
+        common_dir = os.path.join(toplevel, ".git")
+    elif not os.path.isabs(common_dir):
+        common_dir = os.path.abspath(os.path.join(toplevel, common_dir))
+
+    absolute_git_dir = _run_git(path, "rev-parse", "--absolute-git-dir")
+    if absolute_git_dir:
+        absolute_git_dir = os.path.realpath(absolute_git_dir)
+    else:
+        absolute_git_dir = os.path.realpath(common_dir)
+
+    branch = _run_git(path, "rev-parse", "--abbrev-ref", "HEAD") or "detached"
+
+    token_src = f"{absolute_git_dir}::{os.path.realpath(toplevel)}"
+    token = hashlib.sha1(token_src.encode("utf-8")).hexdigest()[:10]
+
+    return {
+        "toplevel": os.path.realpath(toplevel),
+        "common_dir": os.path.realpath(common_dir),
+        "branch": branch,
+        "token": token,
+    }
+
+
+def _is_path_like(value: str) -> bool:
+    """Heuristic: whether a repo query likely represents a local path."""
+    v = (value or "").strip()
+    if not v:
+        return False
+    return (
+        os.path.isabs(v)
+        or v.startswith(".")
+        or v.startswith("~")
+        or os.sep in v
+        or (os.altsep is not None and os.altsep in v)
+    )
+
+
+def _set_loaded_repo_identity(fc, repo_name: str) -> None:
+    """Override loaded repository identity before indexing."""
+    if getattr(fc, "loader", None) is not None:
+        fc.loader.repo_name = repo_name
+    if isinstance(getattr(fc, "repo_info", None), dict):
+        fc.repo_info["name"] = repo_name
+
+
+def _indexed_repo_names(fc) -> list[str]:
+    """Get all currently indexed repository names."""
+    available = _scan_available_indexes_light()
+    return [r.get("name", r.get("repo_name", "")) for r in available if r]
+
+
+def _resolve_repo_query(repo_query: str) -> tuple[Optional[str], Optional[str]]:
+    """
+    Resolve user repo query (name/path/worktree key) to an indexed repo name.
+
+    Returns:
+        (resolved_repo_name, error_message)
+    """
+    indexed = [r.get("name", "") for r in _scan_available_indexes_light()]
+    if not indexed:
+        return None, "No indexed repositories found."
+
+    q = (repo_query or "").strip()
+    if not q:
+        return None, "Repository name/path cannot be empty."
+
+    if q in indexed:
+        return q, None
+
+    # Path-aware exact candidate first
+    path_candidates: list[str] = []
+    if _is_path_like(q):
+        normalized = _normalize_local_source(q)
+        if os.path.isdir(normalized):
+            preferred = _repo_name_from_source(normalized, is_url=False)
+            legacy = _legacy_repo_name_from_source(normalized, is_url=False)
+            path_candidates = [c for c in [preferred, legacy] if c in indexed]
+            if len(path_candidates) == 1:
+                return path_candidates[0], None
+            if len(path_candidates) > 1:
+                choices = ", ".join(sorted(path_candidates))
+                return None, (
+                    f"Repository path '{repo_query}' maps to multiple indexed repositories. "
+                    f"Use one of: {choices}"
+                )
+
+    # Name fallback: exact legacy basename / worktree key prefix
+    q_lower = q.lower()
+    basename_matches = [n for n in indexed if n.lower() == q_lower]
+    if basename_matches:
+        if len(basename_matches) == 1:
+            return basename_matches[0], None
+        choices = ", ".join(sorted(basename_matches))
+        return None, (
+            f"Repository name '{repo_query}' is ambiguous. Use one of: {choices}"
+        )
+
+    worktree_matches = [n for n in indexed if n.lower().startswith(f"{q_lower}__wt__")]
+    if len(worktree_matches) == 1:
+        return worktree_matches[0], None
+    if len(worktree_matches) > 1:
+        choices = ", ".join(sorted(worktree_matches))
+        return None, (
+            f"Repository name '{repo_query}' is ambiguous across worktrees. "
+            f"Use one of: {choices}"
+        )
+
+    # Convenience: if single indexed repo and query is '.' or current-directory-like.
+    if q in {".", "./"} and len(indexed) == 1:
+        return indexed[0], None
+
+    return (
+        None,
+        f"Repository '{repo_query}' is not indexed. Use code_qa or reindex_repo first.",
+    )
 
 
 def _is_repo_indexed(repo_name: str) -> bool:
     """Check whether a repo already has a persisted FAISS index."""
-    fc = _get_fastcode()
-    persist_dir = fc.vector_store.persist_dir
+    persist_dir = _get_persist_dir()
     faiss_path = os.path.join(persist_dir, f"{repo_name}.faiss")
     meta_path = os.path.join(persist_dir, f"{repo_name}_metadata.pkl")
     return os.path.exists(faiss_path) and os.path.exists(meta_path)
@@ -108,10 +349,12 @@ def _apply_forced_env_excludes(fc) -> None:
 
     # Optional (opt-in): site-packages can be huge/noisy in some repos.
     if os.getenv("FASTCODE_EXCLUDE_SITE_PACKAGES", "0").lower() in {"1", "true", "yes"}:
-        forced_patterns.extend([
-            "site-packages",
-            "**/site-packages/**",
-        ])
+        forced_patterns.extend(
+            [
+                "site-packages",
+                "**/site-packages/**",
+            ]
+        )
 
     added = []
     for pattern in forced_patterns:
@@ -127,7 +370,9 @@ def _apply_forced_env_excludes(fc) -> None:
         logger.info(f"Added forced ignore patterns: {added}")
 
 
-def _ensure_repos_ready(repos: List[str], allow_incremental: bool = True, ctx=None) -> List[str]:
+def _ensure_repos_ready(
+    repos: List[str], allow_incremental: bool = True, ctx=None
+) -> List[str]:
     """
     For each repo source string:
       - If already indexed → skip
@@ -141,26 +386,55 @@ def _ensure_repos_ready(repos: List[str], allow_incremental: bool = True, ctx=No
     ready_names: List[str] = []
 
     for source in repos:
-        resolved_is_url = fc._infer_is_url(source)
-        name = _repo_name_from_source(source, resolved_is_url)
+        source_clean = (source or "").strip()
+        if not source_clean:
+            continue
+
+        source_for_infer = source_clean
+        if _is_path_like(source_clean):
+            source_for_infer = _normalize_local_source(source_clean)
+
+        resolved_is_url = fc._infer_is_url(source_for_infer)
+        name = _repo_name_from_source(source_for_infer, resolved_is_url)
+        legacy_name = _legacy_repo_name_from_source(source_for_infer, resolved_is_url)
+
+        if not resolved_is_url:
+            normalized_local = _normalize_local_source(source_for_infer)
+            if not os.path.isdir(normalized_local):
+                logger.error(f"Local path does not exist: {normalized_local}")
+                continue
 
         # Already indexed
-        if _is_repo_indexed(name):
+        indexed_name = name if _is_repo_indexed(name) else None
+        if (
+            indexed_name is None
+            and legacy_name != name
+            and _is_repo_indexed(legacy_name)
+        ):
+            indexed_name = legacy_name
+
+        if indexed_name is not None:
             # Try incremental update for local repos
             if not resolved_is_url and allow_incremental:
-                abs_path = os.path.abspath(source)
+                abs_path = _normalize_local_source(source_for_infer)
                 if os.path.isdir(abs_path):
                     try:
-                        result = fc.incremental_reindex(name, repo_path=abs_path)
+                        result = fc.incremental_reindex(
+                            indexed_name, repo_path=abs_path
+                        )
                         if result and result.get("changes", 0) > 0:
-                            logger.info(f"Incremental update for '{name}': {result}")
+                            logger.info(
+                                f"Incremental update for '{indexed_name}': {result}"
+                            )
                             # Force reload since on-disk data changed
                             fc.repo_indexed = False
                             fc.loaded_repositories.clear()
                     except Exception as e:
-                        logger.warning(f"Incremental reindex failed for '{name}': {e}")
-            logger.info(f"Repo '{name}' ready.")
-            ready_names.append(name)
+                        logger.warning(
+                            f"Incremental reindex failed for '{indexed_name}': {e}"
+                        )
+            logger.info(f"Repo '{indexed_name}' ready.")
+            ready_names.append(indexed_name)
             continue
 
         # Need to index
@@ -168,15 +442,14 @@ def _ensure_repos_ready(repos: List[str], allow_incremental: bool = True, ctx=No
 
         if resolved_is_url:
             # Clone and index
-            logger.info(f"Cloning {source} …")
-            fc.load_repository(source, is_url=True)
+            logger.info(f"Cloning {source_for_infer} …")
+            fc.load_repository(source_for_infer, is_url=True)
+            _set_loaded_repo_identity(fc, name)
         else:
             # Local path
-            abs_path = os.path.abspath(source)
-            if not os.path.isdir(abs_path):
-                logger.error(f"Local path does not exist: {abs_path}")
-                continue
+            abs_path = _normalize_local_source(source_for_infer)
             fc.load_repository(abs_path, is_url=False)
+            _set_loaded_repo_identity(fc, name)
 
         logger.info(f"Indexing '{name}' …")
         fc.index_repository(force=False)
@@ -197,14 +470,28 @@ def _ensure_loaded(fc, ready_names: List[str]) -> bool:
 # ---------------------------------------------------------------------------
 # MCP Server
 # ---------------------------------------------------------------------------
-MCP_SERVER_DESCRIPTION = "Repo-level code understanding - ask questions about any codebase."
+MCP_SERVER_DESCRIPTION = (
+    "Repo-level code understanding - ask questions about any codebase."
+)
 _fastmcp_kwargs = {}
 try:
-    # Backward compatibility: older mcp versions do not accept `description`.
-    if "description" in inspect.signature(FastMCP.__init__).parameters:
+    sig = inspect.signature(FastMCP.__init__).parameters
+    fastmcp_host = os.getenv("FASTMCP_HOST", "0.0.0.0")
+    try:
+        fastmcp_port = int(os.getenv("FASTMCP_PORT", "5555"))
+    except ValueError:
+        logger.warning("Invalid FASTMCP_PORT; falling back to 5555")
+        fastmcp_port = 5555
+
+    if "description" in sig:
         _fastmcp_kwargs["description"] = MCP_SERVER_DESCRIPTION
+    if "port" in sig:
+        _fastmcp_kwargs["port"] = fastmcp_port
+    if "host" in sig:
+        _fastmcp_kwargs["host"] = fastmcp_host
+    if "stateless_http" in sig:
+        _fastmcp_kwargs["stateless_http"] = True
 except (TypeError, ValueError):
-    # If signature introspection fails, fall back to the safest constructor shape.
     pass
 
 mcp = FastMCP("FastCode", **_fastmcp_kwargs)
@@ -283,7 +570,11 @@ def code_qa(
                     start = start or parsed_start
                     end = end or parsed_end
             loc = f"L{start}-L{end}" if start and end else ""
-            parts.append(f"  - {repo}/{file_path}:{loc} ({name})" if repo else f"  - {file_path}:{loc} ({name})")
+            parts.append(
+                f"  - {repo}/{file_path}:{loc} ({name})"
+                if repo
+                else f"  - {file_path}:{loc} ({name})"
+            )
 
     parts.append(f"\n[session_id: {sid}]")
     return "\n".join(parts)
@@ -309,7 +600,7 @@ def list_sessions() -> str:
         title = s.get("title", "Untitled")
         turns = s.get("total_turns", 0)
         mode = "multi-turn" if s.get("multi_turn", False) else "single-turn"
-        lines.append(f"  - {sid}: \"{title}\" ({turns} turns, {mode})")
+        lines.append(f'  - {sid}: "{title}" ({turns} turns, {mode})')
 
     return "\n".join(lines)
 
@@ -369,8 +660,7 @@ def list_indexed_repos() -> str:
     Returns:
         A list of indexed repository names with metadata.
     """
-    fc = _get_fastcode()
-    available = fc.vector_store.scan_available_indexes(use_cache=False)
+    available = _scan_available_indexes_light()
 
     if not available:
         return "No indexed repositories found."
@@ -501,13 +791,22 @@ def get_repo_structure(repo_name: str) -> str:
         Repository summary, directory structure, and language breakdown.
     """
     fc = _get_fastcode()
-    if not _is_repo_indexed(repo_name):
-        return f"Repository '{repo_name}' is not indexed. Use code_qa or reindex_repo first."
+    resolved_repo_name, error = _resolve_repo_query(repo_name)
+    if error:
+        return error
+
+    assert resolved_repo_name is not None
+
+    if not _is_repo_indexed(resolved_repo_name):
+        return (
+            f"Repository '{repo_name}' is not indexed. "
+            "Use code_qa or reindex_repo first."
+        )
 
     overviews = fc.vector_store.load_repo_overviews()
-    overview = overviews.get(repo_name)
+    overview = overviews.get(resolved_repo_name)
     if not overview:
-        return f"No overview found for repository '{repo_name}'. It may need re-indexing."
+        return f"No overview found for repository '{resolved_repo_name}'. It may need re-indexing."
 
     metadata = overview.get("metadata", {})
     summary = metadata.get("summary", "No summary available.")
@@ -515,7 +814,7 @@ def get_repo_structure(repo_name: str) -> str:
     file_structure = metadata.get("file_structure", {})
     languages = file_structure.get("languages", {})
 
-    parts = [f"Repository: {repo_name}", ""]
+    parts = [f"Repository: {resolved_repo_name}", ""]
     parts.append(f"Summary:\n{summary}")
 
     if languages:
@@ -574,7 +873,9 @@ def get_file_summary(file_path: str, repos: list[str]) -> str:
         fm = files[0]
         parts.append(f"Language: {fm.get('language', '?')}")
         mi = fm.get("metadata", {})
-        parts.append(f"Lines: {mi.get('total_lines', '?')} (code: {mi.get('code_lines', '?')})")
+        parts.append(
+            f"Lines: {mi.get('total_lines', '?')} (code: {mi.get('code_lines', '?')})"
+        )
         num_imports = mi.get("num_imports", 0)
         if num_imports:
             parts.append(f"Imports: {num_imports}")
@@ -591,7 +892,9 @@ def get_file_summary(file_path: str, repos: list[str]) -> str:
                 parts.append(f"      .{m}")
 
     if functions:
-        top_level = [f for f in functions if not f.get("metadata", {}).get("class_name")]
+        top_level = [
+            f for f in functions if not f.get("metadata", {}).get("class_name")
+        ]
         if top_level:
             parts.append(f"\nFunctions ({len(top_level)}):")
             for fn in top_level:
@@ -602,14 +905,24 @@ def get_file_summary(file_path: str, repos: list[str]) -> str:
     return "\n".join(parts)
 
 
-def _walk_call_chain(gb, element_id: str, direction: str, hops_left: int,
-                     parts: list, indent: int = 2, visited: set = None):
+def _walk_call_chain(
+    gb,
+    element_id: str,
+    direction: str,
+    hops_left: int,
+    parts: list,
+    indent: int = 2,
+    visited: Optional[Set[str]] = None,
+):
     """Recursively walk the call chain and format output."""
     if visited is None:
         visited = {element_id}
 
-    neighbors = (gb.get_callers(element_id) if direction == "callers"
-                 else gb.get_callees(element_id))
+    neighbors = (
+        gb.get_callers(element_id)
+        if direction == "callers"
+        else gb.get_callees(element_id)
+    )
 
     if not neighbors:
         parts.append(f"{'  ' * indent}(none)")
@@ -621,10 +934,14 @@ def _walk_call_chain(gb, element_id: str, direction: str, hops_left: int,
         visited.add(nid)
         elem = gb.element_by_id.get(nid)
         if elem:
-            loc = f"{elem.relative_path}:L{elem.start_line}" if elem.relative_path else ""
+            loc = (
+                f"{elem.relative_path}:L{elem.start_line}" if elem.relative_path else ""
+            )
             parts.append(f"{'  ' * indent}- {elem.name} [{loc}]")
             if hops_left > 1:
-                _walk_call_chain(gb, nid, direction, hops_left - 1, parts, indent + 1, visited)
+                _walk_call_chain(
+                    gb, nid, direction, hops_left - 1, parts, indent + 1, visited
+                )
 
 
 @mcp.tool()
@@ -658,7 +975,8 @@ def get_call_chain(
     max_hops = min(max_hops, 5)
     gb = fc.graph_builder
     name_lower = symbol_name.lower()
-    target_id, target_elem = None, None
+    target_id = None
+    target_elem = None
 
     # Exact match via element_by_name
     elem = gb.element_by_name.get(symbol_name)
@@ -679,7 +997,7 @@ def get_call_chain(
                 target_elem, target_id = elem, eid
                 break
 
-    if not target_id:
+    if not target_id or target_elem is None:
         return f"Symbol '{symbol_name}' not found in call graph."
 
     parts = [
@@ -714,17 +1032,24 @@ def reindex_repo(repo_source: str) -> str:
     fc = _get_fastcode()
     _apply_forced_env_excludes(fc)
 
-    resolved_is_url = fc._infer_is_url(repo_source)
-    name = _repo_name_from_source(repo_source, resolved_is_url)
-    logger.info(f"Force re-indexing '{name}' from {repo_source}")
+    source_clean = (repo_source or "").strip()
+    source_for_infer = source_clean
+    if _is_path_like(source_clean):
+        source_for_infer = _normalize_local_source(source_clean)
+
+    resolved_is_url = fc._infer_is_url(source_for_infer)
+    name = _repo_name_from_source(source_for_infer, resolved_is_url)
+    logger.info(f"Force re-indexing '{name}' from {source_for_infer}")
 
     if resolved_is_url:
-        fc.load_repository(repo_source, is_url=True)
+        fc.load_repository(source_for_infer, is_url=True)
+        _set_loaded_repo_identity(fc, name)
     else:
-        abs_path = os.path.abspath(repo_source)
+        abs_path = _normalize_local_source(source_for_infer)
         if not os.path.isdir(abs_path):
             return f"Error: Local path does not exist: {abs_path}"
         fc.load_repository(abs_path, is_url=False)
+        _set_loaded_repo_identity(fc, name)
 
     fc.index_repository(force=True)
     count = fc.vector_store.get_count()
@@ -742,18 +1067,52 @@ def reindex_repo(repo_source: str) -> str:
 if __name__ == "__main__":
     import argparse
 
+    default_transport = os.getenv("FASTMCP_TRANSPORT", "stdio")
+    if default_transport not in {"stdio", "sse", "streamable-http"}:
+        logger.warning(
+            "Invalid FASTMCP_TRANSPORT=%s; falling back to stdio",
+            default_transport,
+        )
+        default_transport = "stdio"
+
+    try:
+        default_port = int(os.getenv("FASTMCP_PORT", "5555"))
+    except ValueError:
+        logger.warning("Invalid FASTMCP_PORT; falling back to 5555")
+        default_port = 5555
+
+    default_host = os.getenv("FASTMCP_HOST", "0.0.0.0")
+
     parser = argparse.ArgumentParser(description="FastCode MCP Server")
     parser.add_argument(
-        "--transport", choices=["stdio", "sse"], default="stdio",
-        help="MCP transport (default: stdio)",
+        "--transport",
+        choices=["stdio", "sse", "streamable-http"],
+        default=default_transport,
+        help=f"MCP transport (default: {default_transport})",
     )
     parser.add_argument(
-        "--port", type=int, default=8080,
-        help="Port for SSE transport (default: 8080)",
+        "--port",
+        type=int,
+        default=default_port,
+        help=f"Port for HTTP transport (default: {default_port})",
+    )
+    parser.add_argument(
+        "--host",
+        default=default_host,
+        help=f"Host for HTTP transport (default: {default_host})",
     )
     args = parser.parse_args()
 
+    def _run_http_transport(transport: str) -> None:
+        # FastMCP v2/v3 style: host/port are constructor settings, not run() params.
+        if hasattr(mcp, "settings"):
+            mcp.settings.host = args.host
+            mcp.settings.port = args.port
+        mcp.run(transport=transport)
+
     if args.transport == "sse":
-        mcp.run(transport="sse", sse_params={"port": args.port})
+        _run_http_transport("sse")
+    elif args.transport == "streamable-http":
+        _run_http_transport("streamable-http")
     else:
         mcp.run(transport="stdio")

@@ -143,7 +143,7 @@ query:
 # Answer Generation
 # NOTE: model and base_url are read from environment variables (MODEL, BASE_URL)
 generation:
-  provider: "openai"  # openai, anthropic, or local
+  provider: "openai"
   temperature: 0.4
   max_tokens: 20000
 

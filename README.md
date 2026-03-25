@@ -567,6 +567,23 @@ uv pip install -r requirements.txt
 
 The MCP server should be launched with `.venv/bin/python`, and it needs `OPENAI_API_KEY`, `MODEL`, and `BASE_URL`.
 
+To avoid repeated embedding-model downloads, preload and persist the sentence-transformers cache:
+
+```bash
+python preload_embedding_model.py
+```
+
+For Docker usage, keep cache-related env vars pointed at `/app/data` (already mounted by `./fastcode_data:/app/data`):
+
+```env
+HF_HOME=/app/data/hf-cache
+HUGGINGFACE_HUB_CACHE=/app/data/hf-cache/hub
+TRANSFORMERS_CACHE=/app/data/hf-cache/transformers
+SENTENCE_TRANSFORMERS_HOME=/app/data/hf-cache/sentence-transformers
+```
+
+For `Dockerfile.mcp`, preload now happens automatically at both build time and container startup. In normal usage, `docker compose up` is enough. To skip startup preload temporarily, set `FASTCODE_PRELOAD_ON_STARTUP=0`.
+
 **Cursor** (`~/.cursor/mcp.json`):
 ```json
 {

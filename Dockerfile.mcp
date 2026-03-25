@@ -1,0 +1,52 @@
+FROM python:3.12-slim-bookworm
+
+# 1. Install system dependencies as root
+RUN apt-get update && \
+  apt-get install -y --no-install-recommends \
+  git build-essential curl ca-certificates && \
+  apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
+
+# 2. Install Marksman binary for your Markdown scouting
+RUN curl -L https://github.com/artempyanykh/marksman/releases/latest/download/marksman-linux-x64 -o /usr/local/bin/marksman && \
+  chmod +x /usr/local/bin/marksman
+
+# 3. Create a non-root user and group
+# We use UID 1000 as it's the standard for the first user on Linux/Mac
+RUN groupadd --gid 1000 mcp-group && \
+  useradd --uid 1000 --gid mcp-group --shell /bin/bash --create-home mcpuser
+
+WORKDIR /app
+
+# 4. Install Python dependencies as root (to keep the user home clean)
+COPY requirements.txt ./
+RUN pip install --no-cache-dir --retries 5 --timeout 60 -r requirements.txt
+
+# 5. Pre-download the heavy embedding model
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')"
+
+# 6. Create directories and set ownership BEFORE switching users
+RUN mkdir -p /app/repos /app/data /app/logs && \
+  chown -R mcpuser:mcp-group /app
+
+# 7. Copy the code and set final ownership
+COPY --chown=mcpuser:mcp-group fastcode/ fastcode/
+COPY --chown=mcpuser:mcp-group mcp_server.py api.py ./
+COPY --chown=mcpuser:mcp-group preload_embedding_model.py ./
+COPY --chown=mcpuser:mcp-group docker-entrypoint.sh ./
+COPY --chown=mcpuser:mcp-group config/ config/
+
+# 8. Switch to the non-root user
+USER mcpuser
+
+EXPOSE 5555
+
+ENV PYTHONUNBUFFERED=1
+ENV TOKENIZERS_PARALLELISM=false
+ENV HF_HOME=/app/data/hf-cache
+ENV HUGGINGFACE_HUB_CACHE=/app/data/hf-cache/hub
+ENV TRANSFORMERS_CACHE=/app/data/hf-cache/transformers
+ENV SENTENCE_TRANSFORMERS_HOME=/app/data/hf-cache/sentence-transformers
+ENV FASTCODE_PRELOAD_ON_STARTUP=1
+
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
+CMD ["--transport", "streamable-http", "--port", "5555"]
